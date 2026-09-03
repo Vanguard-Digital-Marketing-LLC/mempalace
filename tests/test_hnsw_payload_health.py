@@ -156,3 +156,85 @@ def test_quarantine_catches_zero_byte_link_lists_when_stale(tmp_path):
     moved_path = Path(moved[0])
     assert moved_path.exists()
     assert moved_path.name.startswith("11111111-2222-3333-4444-555555555555.drift-")
+
+
+# ── total_elements_added is cumulative, not a live count ──────────────
+#
+# Regression tests for the false-quarantine that cost a 183,009-vector
+# index. hnswlib's ``total_elements_added`` counts every add the segment
+# has ever made, including ones later deleted or replaced, so it is
+# legitimately GREATER than ``len(id_to_label)`` on any palace that has
+# ever removed a drawer. Demanding equality condemned a healthy index.
+
+
+def _write_pickled_segment(seg_dir: Path, state: dict, *, payload: int = 4096) -> None:
+    """Write a segment whose metadata pickle carries ``state``."""
+    import pickle
+
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    (seg_dir / "data_level0.bin").write_bytes(b"\0" * payload)
+    (seg_dir / "link_lists.bin").write_bytes(b"\0" * (payload // 8))
+    with open(seg_dir / "index_metadata.pickle", "wb") as f:
+        pickle.dump(state, f, pickle.HIGHEST_PROTOCOL)
+
+
+def _state(*, labels: int, total: int, dimensionality=None) -> dict:
+    return {
+        "dimensionality": dimensionality,
+        "total_elements_added": total,
+        "max_seq_id": None,
+        "id_to_label": {f"d-{i}": i for i in range(labels)},
+        "label_to_id": {i: f"d-{i}" for i in range(labels)},
+        "id_to_seq_id": {},
+    }
+
+
+def test_missing_dimensionality_recoverable_when_total_exceeds_labels(tmp_path):
+    """Deletions make total_elements_added > label count. Still recoverable."""
+    from mempalace.backends.chroma import _missing_dimensionality_appears_recoverable
+
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+    state = _state(labels=183_009, total=188_220)
+    _write_pickled_segment(seg_dir, state)
+
+    assert _missing_dimensionality_appears_recoverable(state, state["id_to_label"], str(seg_dir))
+
+
+def test_missing_dimensionality_not_recoverable_when_total_below_labels(tmp_path):
+    """total < labels is genuinely impossible - stay unrecoverable."""
+    from mempalace.backends.chroma import _missing_dimensionality_appears_recoverable
+
+    seg_dir = tmp_path / "11111111-2222-3333-4444-555555555555"
+    state = _state(labels=100, total=40)
+    _write_pickled_segment(seg_dir, state)
+
+    assert not _missing_dimensionality_appears_recoverable(
+        state, state["id_to_label"], str(seg_dir)
+    )
+
+
+def test_quarantine_spares_healthy_index_with_cumulative_total(tmp_path):
+    """End-to-end: the 2026-08-22 shape must NOT be quarantined."""
+    from mempalace.backends.chroma import quarantine_invalid_hnsw_metadata
+
+    seg = "11111111-2222-3333-4444-555555555555"
+    seg_dir = tmp_path / seg
+    _write_pickled_segment(seg_dir, _state(labels=183_009, total=188_220))
+
+    assert quarantine_invalid_hnsw_metadata(str(tmp_path)) == []
+    assert seg_dir.is_dir(), "healthy index was quarantined"
+
+
+def test_quarantine_still_catches_inconsistent_label_maps(tmp_path):
+    """Relaxing the counter check must not spare a truly broken index."""
+    from mempalace.backends.chroma import quarantine_invalid_hnsw_metadata
+
+    seg = "11111111-2222-3333-4444-555555555555"
+    seg_dir = tmp_path / seg
+    state = _state(labels=100, total=120)
+    state["label_to_id"] = {i: f"WRONG-{i}" for i in range(100)}
+    _write_pickled_segment(seg_dir, state)
+
+    moved = quarantine_invalid_hnsw_metadata(str(tmp_path))
+    assert len(moved) == 1
+    assert not seg_dir.is_dir()

@@ -640,3 +640,59 @@ def test_tool_status_via_sqlite_returns_breakdown(palace_with_drawers, monkeypat
     # ops×2 (incident + repair runbook), design×1 (metaphor).
     assert out["wings"].get("ops") == 2
     assert out["wings"].get("design") == 1
+
+
+# ── Stub segment: pickle absent AND payload far too small ─────────────
+#
+# The failure this closes: after a segment is quarantined, chromadb
+# creates a fresh one sized for ~100 elements. It has no pickle, so
+# ``hnsw_count`` is None and the probe returned "unknown" + "leaving
+# vector search enabled" — the #1222 guard stayed disarmed against an
+# index holding 100 slots while sqlite held 183,198 rows. Filtered
+# queries then fail with "Error finding id" and unfiltered ones quietly
+# degrade, so nothing surfaces the breakage.
+#
+# A never-flushed segment (no data_level0.bin at all) stays "unknown";
+# that case is still genuinely inconclusive.
+
+
+def _write_stub_payload(palace: str, segment_id: str, data_size: int) -> None:
+    seg_dir = os.path.join(palace, segment_id)
+    os.makedirs(seg_dir, exist_ok=True)
+    with open(os.path.join(seg_dir, "data_level0.bin"), "wb") as f:
+        f.write(b"\0" * data_size)
+    with open(os.path.join(seg_dir, "link_lists.bin"), "wb") as f:
+        f.write(b"")
+
+
+def test_capacity_status_flags_stub_payload_against_large_sqlite(tmp_path):
+    """Reproduces the 2026-08-22 regression: 100-slot stub vs 183k rows."""
+    seg = "seg-stub"
+    _seed_chroma_db(str(tmp_path), sqlite_count=183_198, segment_id=seg)
+    _write_stub_payload(str(tmp_path), seg, data_size=167_600)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["status"] == "diverged"
+    assert info["diverged"] is True
+    assert "repair" in info["message"].lower()
+
+
+def test_capacity_status_still_unknown_when_no_payload_written(tmp_path):
+    """No data_level0.bin at all is a fresh segment, not a stub."""
+    seg = "seg-nopayload"
+    _seed_chroma_db(str(tmp_path), sqlite_count=10_000, segment_id=seg)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["status"] == "unknown"
+    assert info["diverged"] is False
+    assert "leaving vector search enabled" in info["message"]
+
+
+def test_capacity_status_tolerates_small_palace_stub(tmp_path):
+    """A stub next to a small sqlite is flush-lag, not corruption."""
+    seg = "seg-small"
+    _seed_chroma_db(str(tmp_path), sqlite_count=120, segment_id=seg)
+    _write_stub_payload(str(tmp_path), seg, data_size=167_600)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["diverged"] is False

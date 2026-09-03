@@ -137,6 +137,34 @@ _HNSW_BLOAT_GUARD = {
 # segfault or hang in native HNSW code.
 _HNSW_MISSING_METADATA_DATA_FLOOR = 1024
 
+# Lower bound on bytes an HNSW element can occupy in data_level0.bin,
+# used to derive a CAPACITY CEILING from payload size when
+# index_metadata.pickle is absent. Real elements cost dim*4 bytes for the
+# vector alone (1,536 at dim=384) plus link and label overhead, so 256 is
+# deliberately far below any real configuration: it over-estimates
+# capacity, which means the stub check only fires on unambiguous cases
+# and never on a merely lagging segment.
+_HNSW_MIN_BYTES_PER_ELEMENT = 256
+
+
+def _hnsw_capacity_ceiling_from_payload(palace_path: str, segment_id: str) -> Optional[int]:
+    """Upper bound on elements a segment's payload could hold, or None.
+
+    Returns None when ``data_level0.bin`` does not exist — a segment that
+    has never written payload is genuinely fresh, and its missing pickle
+    says nothing about whether vector search is usable. When payload IS
+    present, its size caps how many elements the segment can possibly
+    hold, which is enough to recognise a stub standing in for a lost
+    index without loading the segment.
+    """
+    data_path = os.path.join(palace_path, segment_id, "data_level0.bin")
+    try:
+        if not os.path.isfile(data_path):
+            return None
+        return os.path.getsize(data_path) // _HNSW_MIN_BYTES_PER_ELEMENT
+    except OSError:
+        return None
+
 
 def _validate_where(where: Optional[dict]) -> None:
     """Scan a where-clause for unknown operators and raise ``UnsupportedFilterError``.
@@ -571,13 +599,36 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
         divergence_floor = max(_HNSW_DIVERGENCE_FALLBACK_FLOOR, 2 * sync_threshold)
 
         if hnsw_count is None:
-            # No pickle yet, so this probe cannot measure HNSW capacity.
+            # No pickle yet, so this probe cannot COUNT the HNSW elements.
             # Chroma 1.5.x can have binary HNSW files without a flushed
             # metadata pickle; absence of the pickle alone is not proof that
-            # vector search is unusable or dangerous. Keep the status unknown
-            # so MCP does not globally disable vectors on an inconclusive
-            # signal. Corrupt/invalid metadata, when present, is handled by
+            # vector search is unusable or dangerous. Corrupt/invalid
+            # metadata, when present, is handled by
             # quarantine_invalid_hnsw_metadata before Chroma opens.
+            #
+            # But payload size still caps how many elements the segment can
+            # hold. After a quarantine, Chroma creates a replacement sized
+            # for ~100 elements; that stub has no pickle either, so treating
+            # "no pickle" as unconditionally inconclusive left the #1222
+            # fallback disarmed against an index holding 100 slots while
+            # sqlite held 183,198 rows — filtered queries failed outright
+            # and unfiltered ones silently degraded to BM25. Compare the
+            # payload ceiling before concluding nothing can be said.
+            ceiling = _hnsw_capacity_ceiling_from_payload(palace_path, seg_id)
+            if ceiling is not None:
+                shortfall = sqlite_count - ceiling
+                threshold = max(divergence_floor, int(sqlite_count * _HNSW_DIVERGENCE_FRACTION))
+                if shortfall > threshold:
+                    out["divergence"] = shortfall
+                    out["status"] = "diverged"
+                    out["diverged"] = True
+                    out["message"] = (
+                        f"HNSW payload can hold at most ~{ceiling:,} elements but sqlite "
+                        f"has {sqlite_count:,} embeddings, and no metadata pickle was "
+                        "written — this is a replacement stub, not flush-lag. "
+                        "Run `mempalace repair` to rebuild."
+                    )
+                    return out
             out["message"] = (
                 "HNSW capacity unavailable: metadata has not been flushed; "
                 "leaving vector search enabled"
@@ -710,7 +761,14 @@ def _missing_dimensionality_appears_recoverable(
         return False
 
     label_count = len(id_to_label)
-    if int(total) != label_count or len(label_to_id) != label_count:
+    # ``total_elements_added`` is hnswlib's CUMULATIVE add counter: it
+    # counts every element the segment has ever accepted, including ones
+    # later deleted or replaced. On any palace that has removed a drawer
+    # it is legitimately greater than the live label count, so demanding
+    # equality here condemns healthy indexes. Only ``total < label_count``
+    # is actually impossible — you cannot hold more live labels than you
+    # ever added.
+    if int(total) < label_count or len(label_to_id) != label_count:
         return False
     try:
         return all(label_to_id.get(label) == item_id for item_id, label in id_to_label.items())
