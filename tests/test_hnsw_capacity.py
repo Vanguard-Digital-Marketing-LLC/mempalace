@@ -212,6 +212,7 @@ def test_capacity_status_ok_when_balanced(tmp_path):
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
     assert info["status"] == "ok"
     assert info["diverged"] is False
+    assert info["flush_unreachable"] is False
     assert info["sqlite_count"] == 1000
     assert info["hnsw_count"] == 950
 
@@ -695,4 +696,55 @@ def test_capacity_status_tolerates_small_palace_stub(tmp_path):
     _write_stub_payload(str(tmp_path), seg, data_size=167_600)
 
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["diverged"] is False
+
+
+# ── Unreachable sync_threshold ────────────────────────────────────────
+#
+# The #344 bloat guard creates every collection with
+# hnsw:batch_size = hnsw:sync_threshold = 50_000. Chroma only compacts its
+# write buffer into HNSW (and only then writes index_metadata.pickle) once
+# the buffer reaches that threshold, so ANY collection that never grows to
+# 50,000 records never builds an index at all. On the affected palace the
+# closets collection sat at 13,284 for three months: no HNSW, no pickle,
+# and therefore a failed health check that re-quarantined the stub every
+# session — 32 snapshots. The probe must name this cause rather than
+# reporting it as ordinary flush-lag.
+
+
+def test_capacity_status_flags_unreachable_sync_threshold(tmp_path):
+    """sqlite_count below sync_threshold means the index can never flush."""
+    seg = "seg-unreachable"
+    _seed_chroma_db(str(tmp_path), sqlite_count=13_284, segment_id=seg, sync_threshold=50_000)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    # Not "diverged": the records are still reachable through Chroma's
+    # brute-force buffer, so routing everything to BM25 would make search
+    # worse, not better. The defect is that nothing ever surfaced this.
+    assert info["flush_unreachable"] is True
+    assert info["diverged"] is False
+    assert "sync_threshold" in info["message"]
+    assert "50,000" in info["message"]
+    assert "will not resolve on its own" in info["message"]
+
+
+def test_capacity_status_reachable_threshold_stays_unknown(tmp_path):
+    """A collection larger than its threshold is just un-flushed yet."""
+    seg = "seg-reachable"
+    _seed_chroma_db(str(tmp_path), sqlite_count=60_000, segment_id=seg, sync_threshold=50_000)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["flush_unreachable"] is False
+    assert info["status"] == "unknown"
+    assert "leaving vector search enabled" in info["message"]
+
+
+def test_capacity_status_unreachable_ignored_once_pickle_exists(tmp_path):
+    """A flushed index is healthy regardless of how it got there."""
+    seg = "seg-flushed"
+    _seed_chroma_db(str(tmp_path), sqlite_count=13_284, segment_id=seg, sync_threshold=50_000)
+    _write_pickle(str(tmp_path), seg, hnsw_count=13_284)
+
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["status"] == "ok"
     assert info["diverged"] is False

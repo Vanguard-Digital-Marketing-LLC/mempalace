@@ -575,6 +575,7 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
         "hnsw_count": None,
         "divergence": None,
         "diverged": False,
+        "flush_unreachable": False,
         "status": "unknown",
         "message": "",
     }
@@ -614,6 +615,26 @@ def hnsw_capacity_status(palace_path: str, collection_name: str = "mempalace_dra
             # sqlite held 183,198 rows — filtered queries failed outright
             # and unfiltered ones silently degraded to BM25. Compare the
             # payload ceiling before concluding nothing can be said.
+            # Cause 1: the collection can never reach its own flush
+            # threshold. Chroma compacts its write buffer into HNSW — and
+            # only then writes index_metadata.pickle — once the buffer
+            # reaches hnsw:sync_threshold. The #344 bloat guard sets that
+            # to 50,000 at creation, so a collection that never grows past
+            # it never builds an index at all. This is not flush-lag and
+            # will not resolve on its own.
+            if sqlite_count >= _HNSW_DIVERGENCE_FALLBACK_FLOOR and sqlite_count < sync_threshold:
+                out["flush_unreachable"] = True
+                out["message"] = (
+                    f"hnsw:sync_threshold is {sync_threshold:,} but the collection holds "
+                    f"only {sqlite_count:,} records, so Chroma's write buffer can never "
+                    "reach the compaction threshold: no HNSW index is built and no "
+                    "metadata is written. It will not resolve on its own. Lower "
+                    "sync_threshold below the collection size via collection.modify() "
+                    "and re-upsert to force a flush."
+                )
+                return out
+
+            # Cause 2: payload size caps how many elements the segment can
             ceiling = _hnsw_capacity_ceiling_from_payload(palace_path, seg_id)
             if ceiling is not None:
                 shortfall = sqlite_count - ceiling
